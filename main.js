@@ -58,8 +58,6 @@ async function versioned() {
         .catch(() => ({}));
     const at = (path) => (files[path] ? `${path}?v=${files[path]}` : path);
     const pkg = !window.crossOriginIsolated && files["pkg-st/horizon-client_bg.wasm"] ? "pkg-st" : "pkg";
-    // The module must come from the same build as its glue (pkg/horizon-client.js), so it is
-    // loaded from this folder, never from another host.
     return {
         pkg,
         wasmPath: `${pkg}/horizon-client_bg.wasm`,
@@ -69,10 +67,11 @@ async function versioned() {
 }
 
 async function download(url, label, parts) {
-    const entry = parts[url.split("?")[0]];
+    const cleanUrl = url.split("?")[0];
+    const entry = parts[cleanUrl];
     const response = entry
         ? new Response(await joined(url, entry), { headers: { "Content-Length": String(entry.size) } })
-        : await fetch(url);
+        : await fetch(new URL(url, document.baseURI || location.href).href);
     if (!response.ok) throw new Error(`${url}: ${response.status} ${response.statusText}`);
     const total = Number(response.headers.get("Content-Length")) || 0;
     let received = 0;
@@ -87,9 +86,7 @@ async function download(url, label, parts) {
 }
 
 // The player's files (options, saves) live under this folder of the
-// origin's private file system, laid out as in the virtual filesystem. Where
-// that is refused (a file:// page: the offline file), in IndexedDB instead,
-// one record per path.
+// origin's private file system, laid out as in the virtual filesystem.
 async function savedRoot() {
     try {
         return await (await navigator.storage.getDirectory()).getDirectoryHandle("horizon", { create: true });
@@ -116,11 +113,9 @@ function idbOpen() {
     return idbRequest(request);
 }
 
-// A path's record: { data, modified } for a file, { data: null } for a folder.
 async function idbLoad(glue, db) {
     const files = db.transaction("files").objectStore("files");
     const [paths, records] = await Promise.all([idbRequest(files.getAllKeys()), idbRequest(files.getAll())]);
-    // In key order: a folder before what it holds.
     paths.forEach((path, i) => {
         const { data, modified } = records[i];
         if (data) glue.horizon_install_saved_file(path, data, modified);
@@ -158,7 +153,6 @@ async function loadSaved(glue, dir, path) {
     return files;
 }
 
-// The folder holding `parts`, made when `create`; null when it's missing.
 async function folder(root, parts, create) {
     let dir = root;
     for (const part of parts) {
@@ -166,7 +160,6 @@ async function folder(root, parts, create) {
             dir = await dir.getDirectoryHandle(part, { create });
         } catch (e) {
             if (create && e.name === "TypeMismatchError") {
-                // A file where a folder goes now.
                 await dir.removeEntry(part);
                 dir = await dir.getDirectoryHandle(part, { create });
             } else if (e.name === "NotFoundError") {
@@ -195,11 +188,9 @@ async function apply(root, path, kind, data) {
             handle = await dir.getFileHandle(name, { create: true });
         } catch (e) {
             if (e.name !== "TypeMismatchError") throw e;
-            // A folder where a file goes now.
             await dir.removeEntry(name, { recursive: true });
             handle = await dir.getFileHandle(name, { create: true });
         }
-        // Written to a scratch file and swapped in on close: never half a file.
         const writable = await handle.createWritable();
         await writable.write(data);
         await writable.close();
@@ -212,7 +203,6 @@ async function apply(root, path, kind, data) {
     }
 }
 
-// Saves what the game changed since the last time, one batch at a time.
 let saving = null;
 function saveChanges(glue, root) {
     saving ??= (async () => {
@@ -229,12 +219,12 @@ function saveChanges(glue, root) {
     return saving;
 }
 
-// A file the host won't take whole comes from its parts here
-// (web/split_parts.py): joined in order, checked against the original size.
+// Joins chunks in order and verifies file size integrity
 async function joined(url, entry) {
-    const version = new URL(url, location.href).search;
+    const version = new URL(url, document.baseURI || location.href).search;
     const pieces = await Promise.all(entry.parts.map(async (part) => {
-        const response = await fetch(part + version);
+        const partUrl = new URL(part + version, document.baseURI || location.href).href;
+        const response = await fetch(partUrl);
         if (!response.ok) throw new Error(`${part}: ${response.status} ${response.statusText}`);
         return new Uint8Array(await response.arrayBuffer());
     }));
@@ -251,7 +241,7 @@ async function joined(url, entry) {
     return bytes;
 }
 
-// The game's glue, its module and the resources, from the server.
+// The game's glue, its module and the resources
 async function served() {
     await cacheWorker();
     const files = await versioned();
@@ -260,12 +250,20 @@ async function served() {
     const parts = await fetch("parts.json", { cache: "no-store" })
         .then((r) => (r.ok ? r.json() : {}))
         .catch(() => ({}));
-    // Runs the game's main, which only registers the game to start.
-    const module = parts[files.wasmPath] ? await joined(files.wasm, parts[files.wasmPath]) : files.wasm;
-    await glue.default({ module_or_path: module });
+
+    // Construct WebAssembly.Module directly when using split parts
+    let moduleTarget;
+    if (parts[files.wasmPath]) {
+        const assembled = await joined(files.wasm, parts[files.wasmPath]);
+        moduleTarget = await WebAssembly.compile(assembled);
+    } else {
+        moduleTarget = files.wasm;
+    }
+
+    await glue.default({ module_or_path: moduleTarget });
+
     const gz = await download(files.boot, "Downloading resources", parts).catch((e) => {
-        throw new Error(`${e}\n\nThe game's resources aren't in this folder (fs/boot.tar.gz). They are made from ` +
-            "your own copy of Minecraft: Java Edition 26.3: run horizon-prepare, then web/build.sh (or web/bundle.py).");
+        throw new Error(`${e}\n\nThe game's resources aren't in this folder (fs/boot.tar.gz).`);
     });
     const tar = new Uint8Array(
         await new Response(gz.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
@@ -295,23 +293,19 @@ async function main() {
     }
 
     status.textContent = "Loading resources…";
-    // Let the status paint before the game blocks the page while it loads.
     await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
     status.textContent = "";
-    // The game's command-line arguments, from the address: ?args=--world%20T
+
     const args = (new URLSearchParams(location.search).get("args") ?? "").split(" ").filter(Boolean);
     try {
         glue.horizon_start(args);
     } catch (e) {
-        // winit leaves Rust's stack by throwing once its event loop is set up.
         if (!String(e).includes("Using exceptions for control flow")) throw e;
     }
 }
 
 main().catch((e) => {
     console.error(e);
-    // The threaded build shares memory between workers, which browsers allow
-    // only on a cross-origin isolated page.
     const isolation = window.crossOriginIsolated ? "" :
         "\n\nThe page isn't cross-origin isolated: its server must send " +
         "Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp.";
