@@ -4,7 +4,6 @@
       "pkg/horizon-client_bg.wasm.part0",
       "pkg/horizon-client_bg.wasm.part1",
       "pkg/horizon-client_bg.wasm.part2"
-    ],
-    "size": 54429936
+    ]
   }
 }
