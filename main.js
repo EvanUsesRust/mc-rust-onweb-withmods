@@ -203,6 +203,131 @@ async function apply(root, path, kind, data) {
     }
 }
 
+async function readZipEntry(file, wanted) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const view = new DataView(bytes.buffer);
+    for (let at = bytes.length - 22; at >= Math.max(0, bytes.length - 0xFFFF - 22); at--) {
+        if (view.getUint32(at, true) !== 0x06054b50) continue;
+        const directorySize = view.getUint32(at + 12, true);
+        const directoryOffset = view.getUint32(at + 16, true);
+        let entryAt = directoryOffset;
+        const end = directoryOffset + directorySize;
+        while (entryAt < end && view.getUint32(entryAt, true) === 0x02014b50) {
+            const nameSize = view.getUint16(entryAt + 28, true);
+            const extraSize = view.getUint16(entryAt + 30, true);
+            const commentSize = view.getUint16(entryAt + 32, true);
+            const name = new TextDecoder().decode(bytes.subarray(entryAt + 46, entryAt + 46 + nameSize));
+            if (name === wanted) {
+                const method = view.getUint16(entryAt + 10, true);
+                const compressedSize = view.getUint32(entryAt + 20, true);
+                const localAt = view.getUint32(entryAt + 42, true);
+                const localNameSize = view.getUint16(localAt + 26, true);
+                const localExtraSize = view.getUint16(localAt + 28, true);
+                const compressed = bytes.subarray(
+                    localAt + 30 + localNameSize + localExtraSize,
+                    localAt + 30 + localNameSize + localExtraSize + compressedSize);
+                if (method === 0) return new TextDecoder().decode(compressed);
+                if (method === 8) {
+                    const stream = new Blob([compressed]).stream().pipeThrough(
+                        new DecompressionStream("deflate-raw"));
+                    return new TextDecoder().decode(await new Response(stream).arrayBuffer());
+                }
+                return null;
+            }
+            entryAt += 46 + nameSize + extraSize + commentSize;
+        }
+        break;
+    }
+    return null;
+}
+
+async function updateTextSetting(glue, root, path, key, value) {
+    let text = "";
+    try {
+        if (root instanceof IDBDatabase) {
+            const record = await idbRequest(root.transaction("files").objectStore("files").get(path));
+            if (record?.data) text = new TextDecoder().decode(record.data);
+        } else {
+            const parts = path.split("/").filter(Boolean);
+            const dir = await folder(root, parts.slice(0, -1), false);
+            const handle = await dir?.getFileHandle(parts.at(-1), { create: false });
+            if (handle) text = await (await handle.getFile()).text();
+        }
+    } catch (e) {
+        if (e.name !== "NotFoundError" && e.name !== "TypeMismatchError") throw e;
+    }
+    const lines = text.split(/\r?\n/).filter((line) => line && !line.startsWith(`${key}:`));
+    lines.push(`${key}:${value}`);
+    const data = new TextEncoder().encode(`${lines.join("\n")}\n`);
+    glue.horizon_install_saved_file(path, data, Date.now());
+    await apply(root, path, "file", data);
+}
+
+function setupModUpload(glue, root) {
+    const configurePicker = (buttonId, accept, onFile) => {
+        const button = document.getElementById(buttonId);
+        if (!button) return;
+        button.addEventListener("click", () => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = accept;
+        input.onchange = async () => {
+            const file = input.files?.[0];
+            if (!file) return;
+            if (!root) {
+                status.textContent = "Browser storage is unavailable; the mod was not added.";
+                return;
+            }
+            try {
+                const message = await onFile(file);
+                status.textContent = `${message} Reloading…`;
+                setTimeout(() => location.reload(), 500);
+            } catch (e) {
+                console.error(`Horizon: could not add ${file.name}:`, e);
+                status.textContent = `Could not add ${file.name}: ${e}`;
+            }
+        };
+        input.click();
+        });
+    };
+    configurePicker("btn-mod", ".hmod", async (file) => {
+        const name = file.name.split(/[\\/]/).pop() || "";
+        const data = new Uint8Array(await file.arrayBuffer());
+        const path = `horizon-mods/${name}`;
+        glue.horizon_install_saved_file(path, data, file.lastModified || Date.now());
+        await apply(root, path, "file", data);
+        const manifest = await readZipEntry(file, "horizon-mod.toml");
+        const id = manifest?.match(/^\s*id\s*=\s*"([^"]+)"/m)?.[1] ||
+            name.replace(/\.hmod$/i, "");
+        await updateTextSetting(glue, root, "horizon-mods.txt", `mod.${id}`, "true");
+        return `${name} added and enabled.`;
+    });
+    configurePicker("btn-shader", ".hshader,.zip", async (file) => {
+        const name = file.name.split(/[\\/]/).pop() || "";
+        const data = new Uint8Array(await file.arrayBuffer());
+        const path = `shaderpacks/${name}`;
+        glue.horizon_install_saved_file(path, data, file.lastModified || Date.now());
+        await apply(root, path, "file", data);
+        await updateTextSetting(glue, root, "horizon-graphics.txt", "pickedShaderPack", name);
+        return `${name} added and selected.`;
+    });
+    const disableShaders = document.getElementById("btn-shader-off");
+    disableShaders?.addEventListener("click", async () => {
+        if (!root) {
+            status.textContent = "Browser storage is unavailable; shaders could not be disabled.";
+            return;
+        }
+        try {
+            await updateTextSetting(glue, root, "horizon-graphics.txt", "pickedShaderPack", "");
+            status.textContent = "Shaders disabled. Reloading…";
+            setTimeout(() => location.reload(), 500);
+        } catch (e) {
+            console.error("Horizon: could not disable shaders:", e);
+            status.textContent = `Could not disable shaders: ${e}`;
+        }
+    });
+}
+
 let saving = null;
 function saveChanges(glue, root) {
     saving ??= (async () => {
@@ -291,6 +416,7 @@ async function main() {
         });
         addEventListener("pagehide", () => saveChanges(glue, root));
     }
+    setupModUpload(glue, root);
 
     status.textContent = "Loading resources…";
     await new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
